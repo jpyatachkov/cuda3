@@ -1,7 +1,8 @@
 
-#include "cublas_v2.h"
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
+
+#include "cublas_v2.h"
 
 #include <chrono>
 #include <iomanip>
@@ -72,9 +73,7 @@ static void _checkCudaErrorAux(const char *file, unsigned line, const char *stat
  * CUDA kernel
  */
 
-//TODO: быстрые функции суммирования, возведения в степень
-
-/*__global__ void kernel(double * __restrict__ matrix, double * __restrict__ xNext, double * __restrict__ xCur,
+__global__ void kernel(double * __restrict__ matrix, double * __restrict__ xNext, double * __restrict__ xCur,
 					   std::size_t size, double a, double stepX, double stepT) {
 	auto idx = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -113,92 +112,6 @@ __global__ void gpuOnlyKernel(double * __restrict__ matrix, double * __restrict_
 
 			__syncthreads();
 		} 
-	} while (epsilon > EPSILON);
-}
-
-__global__ void gpuOnlyKernelOpt(double * __restrict__ matrix, double * __restrict__ xNext, double * __restrict__ xCur,
-								 std::size_t size, double a, double stepX, double stepT) {
-	auto tIdx = threadIdx.x, tIdy = threadIdx.y;
-	auto bIdx = blockIdx.x,  bIdy = blockIdx.y;
-
-	auto epsilon = 0.0;
-
-	auto matrBegin = BLOCK_SIZE * bIdy;
-	auto matrEnd   = matrBegin + size;
-
-	auto vectBegin = BLOCK_SIZE * bIdx;
-
-	auto matrStep  = BLOCK_SIZE;
-	auto vectStep  = BLOCK_SIZE;
-
-	__shared__ float sharedMatrix[BLOCK_SIZE][BLOCK_SIZE];
-	__shared__ float sharedVector[BLOCK_SIZE + 1];
-
-	do {
-		double sum = 0.0;
-
-		for (auto im = matrBegin, iv = vectBegin; im < matrEnd; im += matrStep, iv += vectStep) {
-			printf("%d\n", im + size * tIdy + tIdx);
-			sharedMatrix[tIdx][tIdy] = matrix[im + size * tIdy + tIdx];
-			sharedVector[tIdx]       = xCur[iv + tIdx];
-
-			__syncthreads();
-
-			for (auto i = 0; i < BLOCK_SIZE; i++)
-				sum += sharedMatrix[tIdx][i] * sharedVector[i];
-
-			__syncthreads();
-		}
-
-		auto idx   = tIdx + (tIdy - 1) * size;
-		if (idx < size) {
-			xNext[idx] = fma(1.0 / a, xCur[idx] - sum, xCur[idx]);
-		}
-
-		__syncthreads();
-
-		epsilon = 0.0;
-
-		for (auto i = 0; i < size; i++)
-			epsilon += fabs(xNext[i] - xCur[i]);
-
-		__syncthreads();
-
-		xCur[idx] = xNext[idx];
-
-		__syncthreads();
-
-		//return;
-	} while (epsilon > EPSILON);
-}*/
-
-__global__ void cublasKernel(cublasHandle_t *handle, const double * __restrict__ matrix, double * __restrict__ xNext, double * __restrict__ xCur, double * __restrict__ buffer,
-							  std::size_t size, double a, double stepX, double stepT) {
-	auto idx = threadIdx.x + blockIdx.x * blockDim.x;
-	auto epsilon = 0.0;
-
-	do {
-		if (idx < size) {
-			cublasDdot(*handle, size, matrix + idx * size, 1, xCur, 1, buffer);
-
-			double sum = 0.0;
-			cublasDasum(*handle, size, buffer, 1, &sum);
-
-			xNext[idx] = xCur[idx] + (1.0 / a) * (xCur[idx] - sum);
-
-			__syncthreads();
-
-			epsilon = 0.0;
-
-			for (auto i = 0; i < size; i++)
-				epsilon += fabs(xNext[i] - xCur[i]);
-
-			__syncthreads();
-
-			xCur[idx] = xNext[idx];
-
-			__syncthreads();
-		}
 	} while (epsilon > EPSILON);
 }
 
@@ -291,46 +204,9 @@ int main() {
 
 	// Full GPU kernel function
 
-	/*auto beginTime = std::chrono::steady_clock::now();
+	auto beginTime = std::chrono::steady_clock::now();
 	gpuOnlyKernel <<< nBlocks, nThreads >>> (::devA, ::devNextX, ::devCurX, nPoints, hostA[nPoints + 1], stepX, stepT);
 	auto gpuOnlyTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - beginTime).count();
-
-	cudaCheck(cudaMemcpy(::hostCurX, ::devCurX, nPoints * sizeof(double), cudaMemcpyDeviceToHost));*/
-
-	// Optimized full GPU kernel function
-
-	dim3 nThreadsOpt(BLOCK_SIZE, BLOCK_SIZE);
-
-	auto blocksX = (nPoints % BLOCK_SIZE == 0) ? nPoints / nThreadsOpt.x : nPoints / nThreadsOpt.x + 1;
-	auto blocksY = (nPoints % BLOCK_SIZE == 0) ? nPoints / nThreadsOpt.y : nPoints / nThreadsOpt.y + 1;
-
-	dim3 nBlocksOpt(blocksX, blocksY);
-
-	//beginTime = std::chrono::steady_clock::now();
-	//gpuOnlyKernelOpt <<< nBlocksOpt, nThreadsOpt >>> (::devA, ::devNextX, ::devCurX, nPoints, hostA[nPoints + 1], stepX, stepT);
-	//auto gpuOnlyOptTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - beginTime).count();
-
-	//cudaCheck(cudaMemcpy(::hostCurX, ::devCurX, nPoints * sizeof(double), cudaMemcpyDeviceToHost));
-
-	// Full GPU kernel function using cuBLAS
-	//beginTime = std::chrono::steady_clock::now();
-	//auto cuBLASTime = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - beginTime).count();
-
-	double *buffer = nullptr;
-	cudaCheck(cudaMalloc((double **)&buffer, nPoints * sizeof(double)));
-
-	cublasHandle_t handle;
-	cublasStatus_t status;
-
-	cublasCreate(&handle);
-	
-	cublasKernel <<< nBlocks, nThreads >>> (&handle, ::devA, ::devNextX, ::devCurX, buffer, nPoints, a, stepX, stepT);
-
-	cublasDestroy(handle);
-
-	cudaCheck(cudaMemcpy(::hostCurX, ::devCurX, nPoints * sizeof(double), cudaMemcpyDeviceToHost));
-
-	cudaCheck(cudaFree((void *)buffer));
 
 	// GPU calculation, CPU stop iteration
 
@@ -356,10 +232,10 @@ int main() {
 		cudaCheck(cudaMemcpy(::devCurX, ::devNextX, nPoints * sizeof(double), cudaMemcpyDeviceToDevice));
 	}*/
 
+	cudaCheck(cudaMemcpy(::hostCurX, ::devCurX, nPoints * sizeof(double), cudaMemcpyDeviceToHost));
+
 
 	printToConsole(::hostCurX, nPoints);
-
-	//std::cout << std::endl << gpuOnlyTime << " " << gpuOnlyOptTime << std::endl;
 
 	_gpuFree();
 	_cpuFree();
